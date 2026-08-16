@@ -26,7 +26,7 @@ let DPS_SEEN_BUFFS = new Set(); // chaves já vistas, pra não reaplicar o padr�
 // (defaultOn); depois disso respeita o que o usuário marcou/desmarcou.
 // Remove buffs que sumiram (ex: trocou de personagem/set no slot).
 function syncBuffState(){
-  const detected = detectTeamSetBuffs(TEAM);
+  const detected = detectTeamBuffs(TEAM);
   const validKeys = new Set(detected.map(b => b.id + ':' + b.ownerSlot));
   for (const key of Array.from(DPS_ACTIVE_BUFFS)) {
     if (!validKeys.has(key)) DPS_ACTIVE_BUFFS.delete(key);
@@ -105,6 +105,14 @@ const OFF_ATK_SCALING = {
   'Yelan':   { 1: 'hp', 2: 'hp' },
   'Kokomi':  { 0: 'hp', 1: 'hp', 2: 'hp' },
   'Nilou':   { 1: 'hp', 2: 'hp' },
+  // Mualani: Sharky's Bite (Ataque Normal, mas o multiplicador vem do
+  // Talento de Habilidade), a própria Habilidade e a Explosão escalam
+  // 100% com HP Máx. — nenhum dano dela usa ATQ.
+  'Mualani': { 0: 'hp', 1: 'hp', 2: 'hp' },
+  'Candace': { 1: 'hp', 2: 'hp' },
+  'Furina':  { 1: 'hp', 2: 'hp' },
+  // Xilonen escala com DEF (Habilidade e Explosão).
+  'Xilonen': { 1: 'def', 2: 'def' },
 };
 function autoStatFor(characterName, talent){
   if (!talent) return 'atk';
@@ -209,7 +217,11 @@ function calcHitDamage(hit, row, globals, autoBuffs){
   // Bônus de dano condicional dos sets de artefato do time (ex: 4pç
   // Gladiator's Finale, 2pç Golden Troupe) — só entra pro talento certo.
   const autoSetBonusPercent = (autoBuffs && hit.talent) ? (autoBuffs.extraDmgByTalentType[hit.talent.type] || 0) : 0;
-  const extraBonus = 1 + (autoBuildBonusPercent + autoSetBonusPercent + (Number(hit.extraDmgPercent) || 0)) / 100;
+  // Bônus de dano de KIT de suporte (ex: Explosão da Mavuika/Furina) — vale
+  // pra qualquer talento, diferente do autoSetBonusPercent que é só pro
+  // tipo de talento específico de um set (ex: Golden Troupe só Habilidade).
+  const autoKitDmgPercent = (autoBuffs && autoBuffs.teamDmgPercent) ? autoBuffs.teamDmgPercent : 0;
+  const extraBonus = 1 + (autoBuildBonusPercent + autoSetBonusPercent + autoKitDmgPercent + (Number(hit.extraDmgPercent) || 0)) / 100;
   let reactionBonusFrac = (Number(hit.reactionBonusPercent) || 0) / 100;
   if (autoBuffs && autoBuffs.reactionBonuses && hit.reaction){
     autoBuffs.reactionBonuses.forEach(rb => {
@@ -432,7 +444,7 @@ function renderBuffsPanel(){
   }).join('');
   el.innerHTML = `
     <h3 class="font-display" style="font-size:15px; color:var(--gold-bright); margin:18px 0 4px;">Buffs do time detectados (aplicados no DPS — Slot 1)</h3>
-    <p class="hint" style="margin-bottom:6px;">Baseado nos sets de artefato equipados nos 4 personagens do time. Desmarque os que não estiverem ativos na sua rotação real (ex: efeitos que dependem de estar fora de campo, de ter usado a Habilidade há pouco, etc).</p>
+    <p class="hint" style="margin-bottom:6px;">Baseado nos sets de artefato equipados E nas Habilidades/Explosões dos personagens no time (ex: RES shred da Xilonen, bônus de dano da Explosão da Mavuika/Furina). Desmarque os que não estiverem ativos na sua rotação real (ex: efeitos que dependem de estar fora de campo, de ter usado a Habilidade há pouco, de o burst já ter decaído, etc).</p>
     ${rows}
   `;
 }
