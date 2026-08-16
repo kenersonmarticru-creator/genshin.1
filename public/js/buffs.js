@@ -47,6 +47,41 @@ const SET_DMG_BUFFS = [
     label: "4pç Viridescent Venerer (em qualquer um do time) — reduz em 40% a RES do inimigo ao elemento levado pelo Redemoinho", defaultOn: false },
   { id: 'deepwood4',    set: 'Deepwood Memories',         pieces: 4, scope: 'enemyResShred', element: 'Dendro', percent: 30,
     label: "4pç Deepwood Memories (em qualquer um do time) — reduz em 30% a RES Dendro do inimigo", defaultOn: false },
+  { id: 'cindercity4',  set: 'Scroll of the Hero of Cinder City', pieces: 4, scope: 'teamDmg', percent: 25.6,
+    label: "4pç Scroll of the Hero of Cinder City (em qualquer um do time) — até +25.6% de Bônus de Dano Elemental pro time (precisa ~2500 DEF em quem veste e ativar a Crystallize/reação correspondente; valor de referência, ajuste conforme o DEF de quem estiver usando)",
+    defaultOn: false },
+];
+
+/*
+  Buffs que vêm do KIT do próprio personagem (Habilidade/Explosão/Passiva),
+  e não de um set de artefato. Esses NUNCA aparecem em "artifactSets" — por
+  isso viviam de fora do detector antigo, e era exatamente por causa disso
+  que um suporte (Mavuika, Xilonen etc.) podia estar no time sem alterar em
+  nada o dano do DPS: só sets de artefato eram lidos.
+
+  Valores de referência tirados de fontes públicas (KQM, Prydwen etc.) no
+  Talento Nível 10, que é o patamar mais comum de endgame — se o talento do
+  seu personagem for maior/menor, ajuste manualmente pelo checkbox + campo
+  "Bônus dano extra"/"Bônus de reação" do golpe, ou pelo shred de RES manual.
+
+  scope (além dos já usados por sets):
+   'teamDmg' -> soma direto no % de dano do golpe do DPS (equivalente a um
+                "Bônus dano extra" automático), não depende do tipo de
+                talento.
+*/
+const CHARACTER_KIT_BUFFS = [
+  { id: 'mavuika_burst', character: 'Mavuika', scope: 'teamDmg', percent: 40,
+    label: "Explosão da Mavuika (Nv.10, FS máx.) — até +40% de dano pro personagem em campo por 20s, decaindo com o tempo (aqui é contado o valor cheio — reduza manualmente se for calcular perto do fim da janela)",
+    defaultOn: false },
+  { id: 'xilonen_skill', character: 'Xilonen', scope: 'enemyResShred', percent: 36,
+    label: "Habilidade da Xilonen (Nv.10) — reduz em 36% a RES do inimigo aos elementos Hydro/Pyro/Electro/Cryo presentes no time (não cobre Geo/Anemo/Dendro)",
+    defaultOn: true },
+  { id: 'furina_burst', character: 'Furina', scope: 'teamDmg', percent: 75,
+    label: "Explosão da Furina (Nv.10, 300 Fanfare) — até +75% de dano pro time por 18s (precisa acumular Fanfare de verdade com variação de HP; reduza manualmente se sua rotação não enche o stack)",
+    defaultOn: false },
+  { id: 'bennett_burst', character: 'Bennett', scope: 'teamAtk', percent: 25,
+    label: "Explosão do Bennett (Nv.10, dentro do campo de cura) — ATQ de time baseado no ATQ base dele (valor aproximado, varia com a build)",
+    defaultOn: false },
 ];
 
 // Escaneia os 4 slots do time e retorna os buffs cujo set está com peças
@@ -61,18 +96,35 @@ function detectTeamSetBuffs(team){
     slot.row.artifactSets.forEach(s => { counts[s.name] = s.count; });
     SET_DMG_BUFFS.forEach(def => {
       const count = counts[def.set] || 0;
-      if (count >= def.pieces) found.push({ ...def, ownerSlot: slotIdx });
+      if (count >= def.pieces) found.push({ ...def, ownerSlot: slotIdx, source: 'set' });
     });
   });
   return found;
 }
 
+// Mesma ideia, mas olhando pra QUEM está no time (nome do personagem), não
+// pro que ele está vestindo — cobre os buffs de Habilidade/Explosão do kit.
+function detectTeamKitBuffs(team){
+  const found = [];
+  team.forEach((slot, slotIdx) => {
+    if (!slot || !slot.row) return;
+    CHARACTER_KIT_BUFFS.forEach(def => {
+      if (def.character === slot.row.character_name) found.push({ ...def, ownerSlot: slotIdx, source: 'kit' });
+    });
+  });
+  return found;
+}
+
+function detectTeamBuffs(team){
+  return [...detectTeamSetBuffs(team), ...detectTeamKitBuffs(team)];
+}
+
 // Soma os buffs ativos (checkbox ligado) que valem pro golpe do DPS (slot 0).
 // Retorna { extraDmgByTalentType: {0:%,1:%,2:%}, reactionBonusPercent,
-//           atkPercentBonus, enemyResShredPercent }
+//           atkPercentBonus, enemyResShredPercent, teamDmgPercent }
 function computeDpsAutoBuffs(team, activeBuffKeys){
-  const detected = detectTeamSetBuffs(team);
-  const result = { extraDmgByTalentType: {}, reactionBonuses: [], atkPercentBonus: 0, enemyResShredPercent: 0 };
+  const detected = detectTeamBuffs(team);
+  const result = { extraDmgByTalentType: {}, reactionBonuses: [], atkPercentBonus: 0, enemyResShredPercent: 0, teamDmgPercent: 0 };
   detected.forEach(b => {
     const key = b.id + ':' + b.ownerSlot;
     if (!activeBuffKeys.has(key)) return;
@@ -86,6 +138,8 @@ function computeDpsAutoBuffs(team, activeBuffKeys){
       result.atkPercentBonus += b.percent;
     } else if (b.scope === 'enemyResShred'){
       result.enemyResShredPercent += b.percent;
+    } else if (b.scope === 'teamDmg'){
+      result.teamDmgPercent += b.percent;
     }
   });
   return result;
@@ -93,6 +147,6 @@ function computeDpsAutoBuffs(team, activeBuffKeys){
 
 function defaultActiveBuffKeys(team){
   const set = new Set();
-  detectTeamSetBuffs(team).forEach(b => { if (b.defaultOn) set.add(b.id + ':' + b.ownerSlot); });
+  detectTeamBuffs(team).forEach(b => { if (b.defaultOn) set.add(b.id + ':' + b.ownerSlot); });
   return set;
 }
