@@ -1,623 +1,283 @@
-/* ===================== DATA (carregado da planilha) ===================== */
-const ELEMENTS = {
-  Pyro:'--pyro', Hydro:'--hydro', Electro:'--electro', Cryo:'--cryo',
-  Anemo:'--anemo', Geo:'--geo', Dendro:'--dendro'
-};
-const CHAR_LEVELS = [0,1,2,3,4,5,6];
-const WEAPON_LEVELS = [1,2,3,4,5];
-
-let CHARACTERS = [];
-let WEAPONS = [];
-// Mapas por id — usados pra resolver o item completo (nome, imagem, custos)
-// a partir só do id salvo no pool do draft (ver buildInitialEstado), assim
-// a gente não duplica o catálogo inteiro dentro do EstadoJSON da partida.
-let CHAR_BY_ID = {};
-let WEAPON_BY_ID = {};
-
-/* ===================== SESSÃO / PARTIDA ===================== */
-let ME = null;            // {id, email, username, isAdmin}
-let MATCH = null;         // objeto retornado pela API (/api/partida)
-let CFG = {};              // alias de MATCH.config
-let ST = null;             // alias de MATCH.estado
-let myPlayerIndex = null;  // 0 (Jogador 1) ou 1 (Jogador 2)
-
-let pollHandle = null;
-let timerHandle = null;
-let pickInFlight = false;
-let skipInFlight = false;
-
-const SCREENS = ['loadingBox','loadError','authRequired','modeChoice','createForm','joinForm','waitingRoom','draft','summary'];
-let currentScreen = '';
-
-function showOnly(id){
-  SCREENS.forEach(s => document.getElementById(s).classList.toggle('hidden', s!==id));
-  currentScreen = id;
-}
-
-function showMsg(el, text, kind){
-  el.textContent = text;
-  el.className = 'msg ' + (kind || '');
-}
-
-function pname(p){
-  if(p===0) return (MATCH && MATCH.jogador1 && MATCH.jogador1.nome) || 'Jogador 1';
-  return (MATCH && MATCH.jogador2 && MATCH.jogador2.nome) || 'Jogador 2';
-}
-
-/* ===================== ESTADO DO DRAFT (funções puras) ===================== */
-function buildSnakeOrder(slotsPerPlayer, startPlayer){
-  const order = [];
-  for(let i=0;i<slotsPerPlayer*2;i++){
-    const round = Math.floor(i/2);
-    const pair = (round % 2 === 0) ? [0,1] : [1,0];
-    let p = pair[i%2];
-    if(startPlayer===1) p = 1-p;
-    order.push(p);
-  }
-  return order;
-}
-
-function cloneState(s){ return JSON.parse(JSON.stringify(s)); }
-
-function buildInitialEstado(cfg){
-  return {
-    phase: 'characters',
-    // Só os ids ficam salvos no estado da partida (não o catálogo inteiro
-    // com nome/imagem/custos de cada item) — cada item já some da lista
-    // conforme é escolhido. Isso evita estourar o limite de 50.000
-    // caracteres por célula da planilha quando o EstadoJSON é salvo.
-    pool: { characters: CHARACTERS.map(c=>c.id), weapons: WEAPONS.map(w=>w.id) },
-    players: [
-      {points:cfg.budget, picksChar:[], picksWeapon:[], fiveStar:0},
-      {points:cfg.budget, picksChar:[], picksWeapon:[], fiveStar:0}
-    ],
-    globalFiveStarUsed: 0,
-    order: buildSnakeOrder(cfg.charSlots, 0),
-    turnIdx: 0,
-    turnStartedAt: new Date().toISOString(),
-    log: []
-  };
-}
-
-function advancePhaseIfNeeded(estado){
-  estado.turnIdx++;
-  if(estado.turnIdx >= estado.order.length){
-    if(estado.phase==='characters'){
-      estado.phase = 'weapons';
-      estado.order = buildSnakeOrder(CFG.weaponSlots, 1);
-      estado.turnIdx = 0;
-      estado.turnStartedAt = new Date().toISOString();
-    } else {
-      estado.phase = 'summary';
-    }
-  } else {
-    estado.turnStartedAt = new Date().toISOString();
-  }
-  return estado;
-}
-
-function levelKeyFor(phase, level){
-  return phase==='weapons' ? ('R'+level) : ('C'+level);
-}
-
-function levelLabelFor(phase, level){
-  return phase==='weapons' ? ('R'+level) : ('C'+level);
-}
-
-function applyPick(estado, playerIdx, itemId, level){
-  const poolKey = estado.phase==='weapons' ? 'weapons' : 'characters';
-  const byId = estado.phase==='weapons' ? WEAPON_BY_ID : CHAR_BY_ID;
-  const idx = estado.pool[poolKey].indexOf(itemId);
-  if(idx===-1) throw new Error('Item não encontrado.');
-  const item = byId[itemId];
-  if(!item) throw new Error('Item não encontrado no catálogo.');
-  const levelKey = levelKeyFor(estado.phase, level);
-  const cost = item.costs[levelKey];
-  if(cost === undefined) throw new Error('Nível inválido.');
-  if(cost > estado.players[playerIdx].points) throw new Error('Pontos insuficientes.');
-  if(item.rarity===5 && estado.globalFiveStarUsed >= CFG.fiveCap) throw new Error('Limite de armas 5★ atingido.');
-
-  estado.pool[poolKey].splice(idx,1);
-  estado.players[playerIdx].points -= cost;
-  const picked = { id:item.id, name:item.name, element:item.element, rarity:item.rarity, image:item.image, level, cost };
-  if(estado.phase==='weapons') estado.players[playerIdx].picksWeapon.push(picked);
-  else estado.players[playerIdx].picksChar.push(picked);
-  if(item.rarity===5 && estado.phase==='weapons'){
-    estado.globalFiveStarUsed++;
-    estado.players[playerIdx].fiveStar++;
-  }
-  estado.log.push({player:playerIdx, name:pname(playerIdx), text:`escolheu ${item.name} (${levelLabelFor(estado.phase,level)} · ${cost} pts)`});
-  return advancePhaseIfNeeded(estado);
-}
-
-function applySkip(estado, playerIdx){
-  estado.log.push({player:playerIdx, name:pname(playerIdx), text:'perdeu a vez (tempo esgotado)'});
-  return advancePhaseIfNeeded(estado);
-}
-
-/* ===================== RENDER ===================== */
-function rarityClass(r){ return r>=5?'r5': r===4?'r4':'r3'; }
-function currentPool(){
-  const ids = ST.phase==='weapons' ? ST.pool.weapons : ST.pool.characters;
-  const byId = ST.phase==='weapons' ? WEAPON_BY_ID : CHAR_BY_ID;
-  return ids.map(id => byId[id]).filter(Boolean);
-}
-
-function imgTag(it, size){
-  if(!it.image) return '';
-  return `<img src="${it.image}" style="width:${size}px;height:${size}px;" class="item-img" onerror="this.style.display='none'">`;
-}
-
-function renderSidePanels(){
-  for(let p=0;p<2;p++){
-    document.getElementById('dispName'+(p+1)).textContent = pname(p);
-    document.getElementById('dispPoints'+(p+1)).textContent = ST.players[p].points;
-
-    const list = document.getElementById('picksP'+(p+1));
-    list.innerHTML = '';
-    const allPicks = [
-      ...ST.players[p].picksChar.map(x=>({...x,kind:'char'})),
-      ...ST.players[p].picksWeapon.map(x=>({...x,kind:'weapon'}))
-    ];
-    const totalSlots = CFG.charSlots + CFG.weaponSlots;
-    for(let i=0;i<totalSlots;i++){
-      if(allPicks[i]){
-        const it = allPicks[i];
-        const chip = document.createElement('div');
-        chip.className = 'pick-chip ' + rarityClass(it.rarity);
-        chip.innerHTML = `${imgTag(it,22)}<span>${it.name} <b style="color:var(--gold-bright);">${levelLabelFor(it.kind==='weapon'?'weapons':'characters', it.level)}</b></span><span class="cost">${it.cost}</span>`;
-        list.appendChild(chip);
-      } else {
-        const slot = document.createElement('div');
-        slot.className = 'empty-slot';
-        slot.textContent = i < CFG.charSlots ? '— personagem —' : '— arma —';
-        list.appendChild(slot);
-      }
-    }
-
-    const dotsWrap = document.getElementById('fsP'+(p+1));
-    dotsWrap.innerHTML = '';
-    for(let i=0;i<Math.max(CFG.fiveCap,1);i++){
-      const d = document.createElement('div');
-      d.className = 'dot' + (i < ST.players[p].fiveStar ? ' filled':'');
-      dotsWrap.appendChild(d);
-    }
-    document.getElementById('panelP'+(p+1)).classList.toggle('turn-active', ST.order[ST.turnIdx]===p);
-  }
-}
-
-function renderGrid(){
-  const grid = document.getElementById('itemGrid');
-  const search = document.getElementById('searchBox').value.toLowerCase();
-  const sort = document.getElementById('sortBox').value;
-  const activePlayer = ST.order[ST.turnIdx];
-  const budgetLeft = ST.players[activePlayer].points;
-  const notMyTurn = activePlayer !== myPlayerIndex;
-  const levels = ST.phase==='weapons' ? WEAPON_LEVELS : CHAR_LEVELS;
-  const cheapestCost = it => Math.min(...levels.map(lvl => it.costs[levelKeyFor(ST.phase, lvl)]));
-
-  let items = currentPool().filter(it => it.name.toLowerCase().includes(search));
-  if(sort==='cost-desc') items.sort((a,b)=>cheapestCost(b)-cheapestCost(a));
-  else if(sort==='cost-asc') items.sort((a,b)=>cheapestCost(a)-cheapestCost(b));
-  else items.sort((a,b)=>a.name.localeCompare(b.name));
-
-  grid.innerHTML = '';
-  items.forEach(it=>{
-    const minCost = cheapestCost(it);
-    const fiveStarBlocked = (it.rarity===5 && ST.globalFiveStarUsed >= CFG.fiveCap);
-    const cantAfford = minCost > budgetLeft;
-    const disabled = fiveStarBlocked || cantAfford || notMyTurn;
-
-    const card = document.createElement('div');
-    card.className = `item-card ${rarityClass(it.rarity)} ${disabled?'disabled':''}`;
-    const elemLabel = it.element ? `<span class="elem-dot" style="background:var(${ELEMENTS[it.element]||'--ink-faint'})"></span>${it.element}` : (ST.phase==='weapons' ? 'Arma' : '');
-    card.innerHTML = `
-      ${imgTag(it,100)}
-      <div style="font-size:10.5px; color:var(--ink-faint); text-transform:uppercase; letter-spacing:.04em; margin-top:6px;">${elemLabel}</div>
-      <span class="iname">${it.name}</span>
-      <div class="imeta"><span class="rarity-tag">${it.rarity}★</span><span class="cost-tag">a partir de ${minCost}</span></div>`;
-    if(!disabled) card.addEventListener('click', ()=>openLevelModal(it));
-    grid.appendChild(card);
-  });
-}
-
-/* ===================== MODAL: escolher constelação/refinamento ===================== */
-function openLevelModal(item){
-  const activePlayer = ST.order[ST.turnIdx];
-  const budgetLeft = ST.players[activePlayer].points;
-  const levels = ST.phase==='weapons' ? WEAPON_LEVELS : CHAR_LEVELS;
-  const isWeapon = ST.phase==='weapons';
-
-  document.getElementById('levelModalTitle').textContent = item.name;
-  document.getElementById('levelModalHint').textContent = isWeapon
-    ? 'Escolha o refinamento — cada nível custa mais pontos.'
-    : 'Escolha a constelação — cada nível custa mais pontos.';
-
-  const grid = document.getElementById('levelGrid');
-  grid.innerHTML = '';
-  levels.forEach(lvl=>{
-    const key = levelKeyFor(ST.phase, lvl);
-    const cost = item.costs[key];
-    const fiveStarBlocked = (item.rarity===5 && ST.globalFiveStarUsed >= CFG.fiveCap);
-    const cantAfford = cost > budgetLeft;
-    const disabled = fiveStarBlocked || cantAfford;
-
-    const btn = document.createElement('div');
-    btn.className = 'level-btn' + (disabled ? ' disabled' : '');
-    btn.innerHTML = `<div class="lv-label">${levelLabelFor(ST.phase, lvl)}</div><div class="lv-cost">${cost} pts</div>`;
-    if(!disabled) btn.addEventListener('click', ()=>{
-      closeLevelModal();
-      makePick(item.id, lvl);
-    });
-    grid.appendChild(btn);
-  });
-
-  document.getElementById('levelModal').classList.remove('hidden');
-}
-function closeLevelModal(){
-  document.getElementById('levelModal').classList.add('hidden');
-}
-document.getElementById('levelModalCancel')?.addEventListener('click', closeLevelModal);
-
-
-function renderTurnInfo(){
-  const activePlayer = ST.order[ST.turnIdx];
-  const isMe = activePlayer === myPlayerIndex;
-  document.getElementById('turnTitle').innerHTML = `Vez de <b class="${activePlayer===0?'p-color-1':'p-color-2'}">${pname(activePlayer)}</b>` + (isMe ? ' <span style="color:var(--gold-bright);">(você)</span>' : '');
-  document.getElementById('phaseCaption').textContent = ST.phase==='weapons' ? 'Fase 2 · Escolha de Armas' : 'Fase 1 · Escolha de Personagens';
-  document.getElementById('phasePill').textContent = ST.phase==='weapons' ? 'Draft — Armas' : 'Draft — Personagens';
-}
-
-function renderLog(){
-  const box = document.getElementById('logList');
-  box.innerHTML = ST.log.slice().reverse().map(l=>{
-    const who = l.player===0 ? 'who1' : 'who2';
-    return `<div class="log-entry"><span class="${who}">${l.name}</span> ${l.text}</div>`;
-  }).join('');
-}
-
-function renderTimerRing(){
-  const circ = 2*Math.PI*66;
-  const ring = document.getElementById('ringFg');
-  ring.style.strokeDasharray = circ;
-  const frac = Math.max(0, ST.timeLeft) / CFG.timer;
-  ring.style.strokeDashoffset = circ * (1-frac);
-  const low = frac < 0.25;
-  ring.style.stroke = low ? 'var(--danger)' : 'var(--gold)';
-  document.getElementById('ringTime').textContent = Math.max(0, ST.timeLeft);
-  document.getElementById('ringTime').style.color = low ? 'var(--danger)' : 'var(--ink)';
-}
-
-function renderAll(){ renderSidePanels(); renderTurnInfo(); renderGrid(); renderLog(); renderTimerRing(); }
-
-/* ===================== TIMER (baseado no relógio do servidor) ===================== */
-function stopTimer(){ clearInterval(timerHandle); timerHandle = null; }
-
-function syncTimerFromState(){
-  stopTimer();
-  if(!ST || ST.phase==='summary') return;
-  renderTimerTick();
-  timerHandle = setInterval(renderTimerTick, 1000);
-}
-
-function renderTimerTick(){
-  if(!ST || ST.phase==='summary'){ stopTimer(); return; }
-  const startedAt = new Date(ST.turnStartedAt).getTime();
-  const elapsed = Math.floor((Date.now() - startedAt) / 1000);
-  const remaining = Math.max(0, CFG.timer - elapsed);
-  ST.timeLeft = remaining;
-  renderTimerRing();
-
-  const activePlayer = ST.order[ST.turnIdx];
-  document.getElementById('skipNote').textContent = remaining<=0 ? `Tempo esgotado — ${pname(activePlayer)} perdeu a vez.` : '';
-
-  // Só o dispositivo de quem está com a vez envia o "perdeu a vez" — evita
-  // as duas pontas tentarem escrever ao mesmo tempo.
-  if(remaining<=0 && activePlayer===myPlayerIndex && !skipInFlight){
-    skipInFlight = true;
-    stopTimer();
-    const newEstado = applySkip(cloneState(ST), activePlayer);
-    sendMatchUpdate(newEstado).finally(()=>{ skipInFlight = false; });
-  }
-}
-
-/* ===================== ESCOLHAS / SINCRONIZAÇÃO ===================== */
-async function makePick(itemId, level){
-  if(pickInFlight) return;
-  const activePlayer = ST.order[ST.turnIdx];
-  if(activePlayer !== myPlayerIndex) return;
-
-  const poolKey = ST.phase==='weapons' ? 'weapons' : 'characters';
-  const byId = ST.phase==='weapons' ? WEAPON_BY_ID : CHAR_BY_ID;
-  const idx = ST.pool[poolKey].indexOf(itemId);
-  if(idx===-1) return;
-  const item = byId[itemId];
-  if(!item) return;
-  const cost = item.costs[levelKeyFor(ST.phase, level)];
-  if(cost === undefined) return;
-  if(cost > ST.players[activePlayer].points) return;
-  if(item.rarity===5 && ST.globalFiveStarUsed >= CFG.fiveCap) return;
-
-  pickInFlight = true;
-  stopTimer();
-  try{
-    const newEstado = applyPick(cloneState(ST), activePlayer, itemId, level);
-    await sendMatchUpdate(newEstado);
-  } catch(e){
-    document.getElementById('skipNote').textContent = e.message;
-    syncTimerFromState();
-  } finally {
-    pickInFlight = false;
-  }
-}
-
-async function sendMatchUpdate(newEstado){
-  const res = await fetch('/api/partida', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ action:'pick', partidaId: MATCH.partidaId, userId: ME.id, estado: newEstado, versaoEsperada: MATCH.versao })
-  });
-  const json = await res.json();
-  if(!json.ok){
-    document.getElementById('skipNote').textContent = json.msg;
-    return;
-  }
-  applyMatch(json.match); // servidor é a fonte da verdade — inclusive em caso de conflito
-}
-
-function applyMatch(match){
-  MATCH = match;
-  CFG = MATCH.config;
-  ST = MATCH.estado;
-
-  if(ST.phase==='summary'){
-    showSummaryScreen();
-  } else {
-    if(currentScreen !== 'draft') showOnly('draft');
-    renderAll();
-    syncTimerFromState();
-  }
-}
-
-/* ===================== POLLING (é o que sincroniza os dois dispositivos) ===================== */
-function startPolling(){
-  stopPolling();
-  pollHandle = setInterval(async ()=>{
-    if(!MATCH) return;
-    try{
-      const res = await fetch('/api/partida?id=' + encodeURIComponent(MATCH.partidaId));
-      const json = await res.json();
-      if(!json.ok) return;
-      const match = json.match;
-
-      if(currentScreen==='waitingRoom'){
-        MATCH = match;
-        renderWaitingRoom();
-        if(match.status !== 'aguardando'){
-          enterDraftScreen(match);
-        }
-      } else if(currentScreen==='draft' || currentScreen==='summary'){
-        if(match.versao !== MATCH.versao || match.status !== MATCH.status){
-          applyMatch(match);
-        }
-      }
-    } catch(e){
-      // falha de rede pontual — tenta de novo no próximo ciclo, sem travar a tela
-    }
-  }, 2500);
-}
-function stopPolling(){ if(pollHandle) clearInterval(pollHandle); pollHandle = null; }
-
-function renderWaitingRoom(){
-  document.getElementById('waitingCode').textContent = MATCH.partidaId;
-  document.getElementById('waitingP1').textContent = MATCH.jogador1 ? MATCH.jogador1.nome : 'Aguardando…';
-  document.getElementById('waitingP2').textContent = MATCH.jogador2 ? MATCH.jogador2.nome : 'Aguardando…';
-}
-
-function enterDraftScreen(match){
-  MATCH = match;
-  CFG = MATCH.config;
-  ST = MATCH.estado;
-  if(MATCH.jogador1 && MATCH.jogador1.id === ME.id) myPlayerIndex = 0;
-  else if(MATCH.jogador2 && MATCH.jogador2.id === ME.id) myPlayerIndex = 1;
-  else myPlayerIndex = null; // admin/organizador acompanha como espectador
-
-  if(ST.phase==='summary'){
-    showSummaryScreen();
-  } else {
-    showOnly('draft');
-    renderAll();
-    syncTimerFromState();
-  }
-  startPolling();
-}
-
-/* ===================== RESUMO + PONTUAÇÃO FINAL (admin) ===================== */
-function showSummaryScreen(){
-  stopTimer();
-  showOnly('summary');
-  document.getElementById('phasePill').textContent = 'Times Finalizados';
-
-  const grid = document.getElementById('summaryGrid');
-  grid.innerHTML = '';
-  for(let p=0;p<2;p++){
-    const spent = CFG.budget - ST.players[p].points;
-    const col = document.createElement('div');
-    col.className = 'sum-col panel';
-    col.innerHTML = `
-      <h3 class="${p===0?'p-color-1':'p-color-2'} font-display">${pname(p)}</h3>
-      <div class="hint" style="margin-bottom:16px;">${spent} / ${CFG.budget} pontos usados · ${ST.players[p].fiveStar} arma(s) 5★</div>
-      <div class="hint" style="text-transform:uppercase; letter-spacing:.08em; margin-bottom:8px;">Personagens</div>
-      ${ST.players[p].picksChar.map(c=>`<div class="sum-item">${imgTag(c,26)}<span>${c.rarity}★ ${c.name} <b style="color:var(--gold-bright);">${levelLabelFor('characters',c.level)}</b></span><span class="cost">${c.cost}</span></div>`).join('') || '<div class="sum-item">Nenhum</div>'}
-      <div class="hint" style="text-transform:uppercase; letter-spacing:.08em; margin:14px 0 8px;">Armas</div>
-      ${ST.players[p].picksWeapon.map(w=>`<div class="sum-item">${imgTag(w,26)}<span>${w.rarity}★ ${w.name} <b style="color:var(--gold-bright);">${levelLabelFor('weapons',w.level)}</b></span><span class="cost">${w.cost}</span></div>`).join('') || '<div class="sum-item">Nenhuma</div>'}
-    `;
-    grid.appendChild(col);
-  }
-
-  renderFinalScoreBanner();
-  renderAdminScorePanel();
-}
-
-function renderFinalScoreBanner(){
-  const banner = document.getElementById('finalScoreBanner');
-  if(MATCH.status === 'finalizada'){
-    banner.classList.remove('hidden');
-    const j1 = MATCH.pontosFinais.j1 ?? '—';
-    const j2 = MATCH.pontosFinais.j2 ?? '—';
-    document.getElementById('finalScoreText').textContent = `${pname(0)}  ${j1}  ×  ${j2}  ${pname(1)}`;
-    document.getElementById('finalScoreWinner').textContent = MATCH.vencedor ? `Vencedor: ${MATCH.vencedor}` : 'Empate';
-  } else {
-    banner.classList.add('hidden');
-  }
-}
-
-function renderAdminScorePanel(){
-  const panel = document.getElementById('adminScorePanel');
-  if(!ME.isAdmin || MATCH.status === 'finalizada'){
-    panel.classList.add('hidden');
-    return;
-  }
-  panel.classList.remove('hidden');
-  document.getElementById('adminScoreLabel1').textContent = 'Pontos — ' + pname(0);
-  document.getElementById('adminScoreLabel2').textContent = 'Pontos — ' + pname(1);
-  const winnerSelect = document.getElementById('adminScoreWinner');
-  winnerSelect.innerHTML = `<option value="">Empate / não definir</option><option value="${pname(0)}">${pname(0)}</option><option value="${pname(1)}">${pname(1)}</option>`;
-}
-
-document.getElementById('adminScoreBtn')?.addEventListener('click', async ()=>{
-  const msgEl = document.getElementById('adminScoreMsg');
-  const j1 = document.getElementById('adminScoreJ1').value;
-  const j2 = document.getElementById('adminScoreJ2').value;
-  const vencedor = document.getElementById('adminScoreWinner').value;
-  try{
-    const res = await fetch('/api/partida', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({
-        action: 'finalizar', partidaId: MATCH.partidaId, requesterId: ME.id,
-        pontosJ1: j1===''?null:Number(j1), pontosJ2: j2===''?null:Number(j2), vencedor
-      })
-    });
-    const json = await res.json();
-    if(!json.ok) throw new Error(json.msg);
-    MATCH = json.match;
-    showMsg(msgEl, 'Pontuação final salva!', 'ok');
-    renderFinalScoreBanner();
-    renderAdminScorePanel();
-  } catch(e){
-    showMsg(msgEl, e.message, 'error');
-  }
-});
-
-/* ===================== CRIAR / ENTRAR EM PARTIDA ===================== */
-document.getElementById('chooseCreate')?.addEventListener('click', ()=> showOnly('createForm'));
-document.getElementById('chooseJoin')?.addEventListener('click', ()=> showOnly('joinForm'));
-document.getElementById('backFromCreate')?.addEventListener('click', ()=> showOnly('modeChoice'));
-document.getElementById('backFromJoin')?.addEventListener('click', ()=> showOnly('modeChoice'));
-
-document.getElementById('createBtn')?.addEventListener('click', async ()=>{
-  const msgEl = document.getElementById('createMsg');
-  const cfg = {
-    budget: parseInt(document.getElementById('cfgBudget').value)||550,
-    charSlots: parseInt(document.getElementById('cfgChars').value)||4,
-    weaponSlots: parseInt(document.getElementById('cfgWeapons').value)||4,
-    fiveCap: parseInt(document.getElementById('cfgFiveStar').value)||0,
-    timer: parseInt(document.getElementById('cfgTimer').value)||45,
-  };
-  const estadoInicial = buildInitialEstado(cfg);
-
-  try{
-    const res = await fetch('/api/partida', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ action:'create', hostId: ME.id, hostName: ME.username, config: cfg, estado: estadoInicial })
-    });
-    const json = await res.json();
-    if(!json.ok) throw new Error(json.msg);
-
-    const matchRes = await fetch('/api/partida?id=' + encodeURIComponent(json.partidaId));
-    const matchJson = await matchRes.json();
-    if(!matchJson.ok) throw new Error(matchJson.msg);
-
-    MATCH = matchJson.match;
-    myPlayerIndex = null; // admin acompanha como espectador — não ocupa vaga de jogador
-    renderWaitingRoom();
-    showOnly('waitingRoom');
-    startPolling();
-  } catch(e){
-    showMsg(msgEl, e.message, 'error');
-  }
-});
-
-document.getElementById('joinBtn')?.addEventListener('click', async ()=>{
-  const msgEl = document.getElementById('joinMsg');
-  const code = document.getElementById('joinCode').value.trim().toUpperCase();
-  if(!code){ showMsg(msgEl, 'Digite o código da partida.', 'error'); return; }
-
-  try{
-    const res = await fetch('/api/partida', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ action:'join', partidaId: code, userId: ME.id, userName: ME.username })
-    });
-    const json = await res.json();
-    if(!json.ok) throw new Error(json.msg);
-
-    // 'espectador' = o próprio admin reabrindo a tela da partida que criou.
-    myPlayerIndex = json.papel==='jogador1' ? 0 : json.papel==='jogador2' ? 1 : null;
-    MATCH = json.match;
-
-    if(MATCH.status === 'aguardando'){
-      renderWaitingRoom();
-      showOnly('waitingRoom');
-      startPolling();
-    } else {
-      enterDraftScreen(MATCH);
-    }
-  } catch(e){
-    showMsg(msgEl, e.message, 'error');
-  }
-});
-
-document.getElementById('searchBox')?.addEventListener('input', renderGrid);
-document.getElementById('sortBox')?.addEventListener('change', renderGrid);
-document.getElementById('restartBtn')?.addEventListener('click', ()=>{
-  window.location.reload();
-});
-
-/* ===================== BOOT (carrega planilha + sessão) ===================== */
-async function boot(){
-  try{
-    [CHARACTERS, WEAPONS] = await Promise.all([loadCharacters(), loadWeapons()]);
-    CHAR_BY_ID = Object.fromEntries(CHARACTERS.map(c => [c.id, c]));
-    WEAPON_BY_ID = Object.fromEntries(WEAPONS.map(w => [w.id, w]));
-  } catch(e){
-    showOnly('loadError');
-    document.getElementById('loadErrorText').textContent = 'Erro ao carregar a planilha: ' + e.message;
-    return;
-  }
-
-  ME = await getSession();
-  if(!ME){
-    showOnly('authRequired');
-    return;
-  }
-
-  document.getElementById('meName').textContent = ME.username || ME.email;
-  document.getElementById('phasePill').textContent = 'Configuração';
-
-  if(ME.isAdmin){
-    const link = document.getElementById('navAdminLink');
-    if(link) link.classList.remove('hidden');
-  } else {
-    document.getElementById('chooseCreate').classList.add('hidden');
-    document.getElementById('notAdminNote').textContent = 'Só o administrador cria partidas — peça o código a ele.';
-  }
-
-  showOnly('modeChoice');
-}
-// sheets.js é compartilhado com index.html (que só usa as funções puras de
-// pontuação/draft, não a tela em si) — só inicia o boot da tela de draft
-// nas páginas que realmente têm essa tela (draft.html).
-if(document.getElementById('draft')) boot();
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Confronto Abissal — Draft</title>
+<link rel="stylesheet" href="css/style.css">
+<style>
+.players-row{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:8px; }
+.p-color-1{ color: var(--hydro); } .p-color-2{ color: var(--pyro); }
+.grid-setup{ display:grid; grid-template-columns: repeat(auto-fit, minmax(210px,1fr)); gap:16px; margin: 22px 0; }
+
+.draft-layout{ display:grid; grid-template-columns: 250px 1fr 250px; gap:18px; align-items:start; }
+@media (max-width:920px){ .draft-layout{ grid-template-columns:1fr; } .side-panel{ order:2; } .board-panel{ order:1; } }
+
+.side-panel .p-name{ font-family:'Cinzel'; font-size:16px; font-weight:700; margin-bottom:4px; }
+.side-panel .p-points{ font-size:26px; font-weight:800; font-family:'Cinzel'; margin-bottom:2px; }
+.side-panel .p-points-label{ font-size:11px; color:var(--ink-faint); text-transform:uppercase; letter-spacing:0.08em; margin-bottom:14px; }
+.turn-active{ border-color: var(--gold); box-shadow: 0 0 0 1px var(--gold), 0 0 26px rgba(201,169,97,0.18); }
+
+.pick-list{ display:flex; flex-direction:column; gap:8px; margin-top:6px; }
+.pick-chip{ display:flex; align-items:center; gap:8px; font-size:12.5px; padding:6px 9px; border-radius:8px;
+  background:rgba(255,255,255,0.03); border-left:3px solid var(--ink-faint); }
+.pick-chip img{ width:22px; height:22px; border-radius:5px; object-fit:cover; }
+.pick-chip.r5{ border-left-color: var(--r5-a); } .pick-chip.r4{ border-left-color: var(--r4-a); }
+.pick-chip .cost{ margin-left:auto; color:var(--ink-faint); font-family:'Cinzel'; font-size:11px; }
+.empty-slot{ font-size:12px; color:var(--ink-faint); padding:7px 9px; border:1px dashed var(--line); border-radius:8px; }
+
+.fivestar-track{ margin-top:16px; padding-top:14px; border-top:1px solid var(--line); }
+.fivestar-track .lbl{ font-size:11px; color:var(--ink-faint); text-transform:uppercase; letter-spacing:0.08em; margin-bottom:8px; }
+.dots{ display:flex; gap:6px; }
+.dot{ width:14px; height:14px; border-radius:3px; border:1px solid var(--r5-b); transform:rotate(45deg); }
+.dot.filled{ background: var(--r5-a); box-shadow:0 0 8px rgba(240,207,126,0.6); }
+
+.board-panel{ text-align:center; padding-top:26px; }
+.turn-title{ font-size:13px; letter-spacing:0.12em; text-transform:uppercase; color:var(--ink-dim); margin-bottom:14px;}
+.turn-title b{ color:var(--gold-bright); }
+.ring-wrap{ position:relative; width:150px; height:150px; margin:0 auto 16px; }
+.ring-wrap svg{ transform:rotate(-90deg); width:150px; height:150px; }
+.ring-bg{ fill:none; stroke: rgba(255,255,255,0.06); stroke-width:8; }
+.ring-fg{ fill:none; stroke-width:8; stroke-linecap:round; transition: stroke-dashoffset 1s linear, stroke .3s ease; }
+.ring-time{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-family:'Cinzel'; font-size:38px; font-weight:700; }
+.phase-caption{ font-size:12.5px; color:var(--ink-faint); margin-bottom:22px; }
+.toolbar{ display:flex; gap:10px; margin-bottom:16px; flex-wrap:wrap; justify-content:center; }
+.toolbar input[type=text]{ background:var(--void-0); border:1px solid var(--line); color:var(--ink);
+  padding:9px 14px; border-radius:9px; font-size:13.5px; min-width:180px; outline:none; }
+.toolbar select{ background:var(--void-0); border:1px solid var(--line); color:var(--ink-dim);
+  padding:9px 12px; border-radius:9px; font-size:13px; outline:none; }
+
+.item-grid{ display:grid; grid-template-columns:repeat(auto-fill, minmax(126px,1fr)); gap:12px;
+  max-height:560px; overflow-y:auto; padding:4px 6px 4px 2px; }
+.item-grid::-webkit-scrollbar{ width:6px; }
+.item-grid::-webkit-scrollbar-thumb{ background: var(--void-3); border-radius:3px; }
+.item-card{ position:relative; border-radius:12px; padding:10px 10px 10px; background: var(--void-2);
+  border:1px solid var(--line); cursor:pointer; text-align:left; transition: transform .12s ease, border-color .12s ease; }
+.item-card:hover:not(.disabled){ transform: translateY(-3px); border-color: var(--gold); }
+.item-card.r5{ background: linear-gradient(160deg, rgba(240,207,126,0.10), var(--void-2) 60%); border-color: rgba(240,207,126,0.35); }
+.item-card.r4{ background: linear-gradient(160deg, rgba(214,179,240,0.08), var(--void-2) 60%); border-color: rgba(214,179,240,0.25); }
+.item-card.disabled{ opacity:0.32; cursor:not-allowed; filter:grayscale(0.6); }
+.item-card .elem-dot{ width:9px; height:9px; border-radius:50%; display:inline-block; margin-right:6px; vertical-align:middle; }
+.item-card .iname{ font-size:13px; font-weight:700; line-height:1.25; display:block; margin-top:6px; min-height:32px; }
+.item-card .imeta{ display:flex; justify-content:space-between; align-items:center; margin-top:8px; }
+.item-card .rarity-tag{ font-family:'Cinzel'; font-size:10px; letter-spacing:0.05em; }
+.item-card.r5 .rarity-tag{ color: var(--r5-a); } .item-card.r4 .rarity-tag{ color: var(--r4-a); } .item-card.r3 .rarity-tag{ color: var(--r3-a); }
+.item-card .cost-tag{ font-family:'Cinzel'; font-weight:700; font-size:11px; color:var(--gold-bright); }
+
+.log-panel{ margin-top:18px; text-align:left; }
+.log-panel .lbl{ font-size:11px; color:var(--ink-faint); text-transform:uppercase; letter-spacing:0.08em; margin-bottom:10px; }
+.log-entry{ font-size:12.5px; color:var(--ink-dim); padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.04); }
+.log-entry .who1{ color:var(--hydro); } .log-entry .who2{ color:var(--pyro); }
+
+.summary-grid{ display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+@media (max-width:760px){ .summary-grid{ grid-template-columns:1fr; } }
+.sum-item{ display:flex; align-items:center; gap:10px; padding:9px 12px; border-radius:9px; background:rgba(255,255,255,0.03); margin-bottom:6px; font-size:13.5px; }
+.sum-item img{ width:26px; height:26px; border-radius:6px; object-fit:cover; }
+.sum-item .cost{ margin-left:auto; font-family:'Cinzel'; color:var(--gold-bright); font-size:12.5px; }
+.skip-note{ font-size:12px; color:var(--danger); margin-top:8px; height:16px; }
+
+.mode-choice{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:20px 0; }
+@media (max-width:700px){ .mode-choice{ grid-template-columns:1fr; } }
+.mode-card{ border:1px solid var(--line); border-radius:12px; padding:18px; text-align:center; cursor:pointer; background:var(--void-2); transition:border-color .12s ease; }
+.mode-card:hover{ border-color:var(--gold); }
+.mode-card h3{ font-family:'Cinzel'; font-size:15px; color:var(--gold-bright); margin-bottom:6px; }
+.mode-card p{ font-size:12.5px; color:var(--ink-faint); }
+
+.code-display{ font-family:'Cinzel'; font-size:34px; font-weight:800; letter-spacing:0.15em; color:var(--gold-bright); text-align:center; padding:18px; border:1px dashed var(--gold); border-radius:12px; margin:16px 0; }
+.waiting-dots::after{ content:'…'; animation: dots 1.2s steps(4,end) infinite; }
+@keyframes dots{ 0%,20%{content:'';} 40%{content:'.';} 60%{content:'..';} 80%,100%{content:'...';} }
+
+.admin-score-panel{ margin-top:22px; padding-top:18px; border-top:1px solid var(--line); }
+.admin-score-panel .grid-setup{ margin:14px 0; }
+.final-score-banner{ text-align:center; padding:16px; margin-bottom:20px; border-radius:12px; border:1px solid var(--gold); background:rgba(201,169,97,0.08); }
+.final-score-banner .fs-points{ font-family:'Cinzel'; font-size:28px; font-weight:800; color:var(--gold-bright); }
+
+.modal-overlay{ position:fixed; inset:0; background:rgba(10,6,3,0.78); display:flex; align-items:center; justify-content:center; z-index:80; padding:20px; }
+.modal-box{ background:linear-gradient(180deg, var(--void-2), var(--void-1)); border:1px solid var(--gold); border-radius:16px; padding:26px; max-width:440px; width:100%; }
+.level-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(76px,1fr)); gap:10px; margin:20px 0; }
+.level-btn{ border:1px solid var(--line); border-radius:10px; padding:12px 6px; text-align:center; cursor:pointer; background:var(--void-2); transition:border-color .12s ease; }
+.level-btn:hover:not(.disabled){ border-color:var(--gold); }
+.level-btn.disabled{ opacity:0.32; cursor:not-allowed; }
+.level-btn .lv-label{ font-family:'Cinzel'; font-size:14px; color:var(--gold-bright); font-weight:700; }
+.level-btn .lv-cost{ font-size:11px; color:var(--ink-faint); margin-top:5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div><h1>Confronto Abissal</h1><p>Sistema de Draft &amp; Pontuação</p></div>
+    </div>
+    <div style="display:flex; align-items:center; gap:12px;">
+      <div class="navlinks"><a href="index.html">Perfil</a><a href="draft.html" class="active">Draft</a><a href="admin.html" id="navAdminLink" class="hidden">Admin</a></div>
+      <div class="phase-pill" id="phasePill">Carregando...</div>
+    </div>
+  </div>
+
+  <section id="loadingBox" class="panel">
+    <p class="hint" style="color:var(--ink-dim);">Buscando personagens e armas na planilha…</p>
+  </section>
+
+  <section id="loadError" class="panel hidden">
+    <p style="color:var(--danger);" id="loadErrorText"></p>
+  </section>
+
+  <section id="authRequired" class="panel hidden">
+    <h2 class="font-display" style="font-size:18px; color:var(--gold-bright);">Entre na sua conta</h2>
+    <p class="hint" style="margin:10px 0 16px;">Você precisa estar logado pra criar ou entrar numa partida de draft.</p>
+    <div class="center-actions"><a href="index.html" class="btn btn-primary">Ir para o Perfil</a></div>
+  </section>
+
+  <!-- ESCOLHA: criar partida ou entrar com código -->
+  <section id="modeChoice" class="panel hidden">
+    <h2 class="font-display" style="font-size:18px; color:var(--gold-bright);">Preparar o Confronto</h2>
+    <p class="hint" style="margin-top:8px;">Logado como <b id="meName"></b>.</p>
+    <p class="hint" id="notAdminNote" style="margin-top:4px; color:var(--gold-bright);"></p>
+    <div class="mode-choice">
+      <div class="mode-card" id="chooseCreate">
+        <h3>Criar Partida</h3>
+        <p>Você define as regras e gera um código pra convidar os dois jogadores. Você acompanha a partida como organizador/espectador — não joga. (Só o administrador vê esta opção.)</p>
+      </div>
+      <div class="mode-card" id="chooseJoin">
+        <h3>Entrar com Código</h3>
+        <p>O administrador criou a partida e te passou um código de 6 letras/números — entre com ele pra ocupar uma vaga de jogador.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- CRIAR PARTIDA -->
+  <section id="createForm" class="panel hidden">
+    <h2 class="font-display" style="font-size:18px; color:var(--gold-bright);">Criar Partida</h2>
+    <div class="grid-setup">
+      <div class="field"><label>Pontuação por jogador</label><input type="number" id="cfgBudget" value="550" min="50" step="10"></div>
+      <div class="field"><label>Personagens por jogador</label><input type="number" id="cfgChars" value="4" min="1" max="12"></div>
+      <div class="field"><label>Armas por jogador</label><input type="number" id="cfgWeapons" value="4" min="1" max="12"></div>
+      <div class="field"><label>Limite de armas 5★ (total da partida)</label><input type="number" id="cfgFiveStar" value="5" min="0" max="20"></div>
+      <div class="field"><label>Tempo por escolha (segundos)</label><input type="number" id="cfgTimer" value="45" min="10" max="180"></div>
+    </div>
+    <div class="rules-box">
+      <b>Como funciona:</b> o draft acontece em duas fases — primeiro os <b>personagens</b>, depois as <b>armas</b> — em ordem serpente. Ao escolher um item, o jogador também escolhe a constelação (personagens) ou refinamento (armas) — cada nível custa mais pontos, definidos pelo admin no painel. Itens escolhidos saem do pool. Armas 5★ são limitadas ao valor definido acima. Estourou o tempo? A vez passa automaticamente. Você (admin) não joga — só organiza e, no final, lança a pontuação.
+    </div>
+    <div class="msg" id="createMsg"></div>
+    <div class="center-actions">
+      <button class="btn btn-ghost" id="backFromCreate">Voltar</button>
+      <button class="btn btn-primary" id="createBtn">Criar Partida</button>
+    </div>
+  </section>
+
+  <!-- ENTRAR COM CÓDIGO -->
+  <section id="joinForm" class="panel hidden">
+    <h2 class="font-display" style="font-size:18px; color:var(--gold-bright);">Entrar com Código</h2>
+    <div class="field" style="max-width:260px; margin:16px auto;">
+      <label>Código da partida</label>
+      <input type="text" id="joinCode" maxlength="6" style="text-transform:uppercase; text-align:center; letter-spacing:0.2em; font-family:'Cinzel'; font-size:20px;">
+    </div>
+    <div class="msg" id="joinMsg"></div>
+    <div class="center-actions">
+      <button class="btn btn-ghost" id="backFromJoin">Voltar</button>
+      <button class="btn btn-primary" id="joinBtn">Entrar</button>
+    </div>
+  </section>
+
+  <!-- SALA DE ESPERA -->
+  <section id="waitingRoom" class="panel hidden">
+    <h2 class="font-display" style="font-size:18px; color:var(--gold-bright); text-align:center;">Aguardando os jogadores<span class="waiting-dots"></span></h2>
+    <div class="code-display" id="waitingCode"></div>
+    <p class="hint" style="text-align:center;">Compartilhe esse código com os dois jogadores. A partida começa sozinha assim que os dois entrarem.</p>
+    <div class="grid-setup" style="margin-top:18px;">
+      <div class="field"><label class="p-color-1">Jogador 1</label><div class="hint" id="waitingP1">Aguardando…</div></div>
+      <div class="field"><label class="p-color-2">Jogador 2</label><div class="hint" id="waitingP2">Aguardando…</div></div>
+    </div>
+  </section>
+
+
+  <section id="draft" class="hidden">
+    <div class="draft-layout">
+      <div class="panel side-panel" id="panelP1">
+        <div class="p-name p-color-1" id="dispName1">Jogador 1</div>
+        <div class="p-points" id="dispPoints1">550</div>
+        <div class="p-points-label">pontos restantes</div>
+        <div class="pick-list" id="picksP1"></div>
+        <div class="fivestar-track"><div class="lbl">Armas 5★ no time</div><div class="dots" id="fsP1"></div></div>
+      </div>
+
+      <div class="panel board-panel">
+        <div class="turn-title" id="turnTitle">Vez de <b>Jogador 1</b></div>
+        <div class="ring-wrap">
+          <svg viewBox="0 0 150 150">
+            <circle class="ring-bg" cx="75" cy="75" r="66"></circle>
+            <circle class="ring-fg" id="ringFg" cx="75" cy="75" r="66"></circle>
+          </svg>
+          <div class="ring-time" id="ringTime">45</div>
+        </div>
+        <div class="phase-caption" id="phaseCaption">Fase 1 · Escolha de Personagens</div>
+        <div class="skip-note" id="skipNote"></div>
+        <div class="toolbar">
+          <input type="text" id="searchBox" placeholder="Buscar...">
+          <select id="sortBox">
+            <option value="cost-desc">Custo: maior primeiro</option>
+            <option value="cost-asc">Custo: menor primeiro</option>
+            <option value="name">Nome A–Z</option>
+          </select>
+        </div>
+        <div class="item-grid" id="itemGrid"></div>
+        <div class="log-panel"><div class="lbl">Histórico</div><div id="logList"></div></div>
+      </div>
+
+      <div class="panel side-panel" id="panelP2">
+        <div class="p-name p-color-2" id="dispName2">Jogador 2</div>
+        <div class="p-points" id="dispPoints2">550</div>
+        <div class="p-points-label">pontos restantes</div>
+        <div class="pick-list" id="picksP2"></div>
+        <div class="fivestar-track"><div class="lbl">Armas 5★ no time</div><div class="dots" id="fsP2"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="summary" class="hidden panel">
+    <h2 class="font-display" style="font-size:20px; color:var(--gold-bright); text-align:center; margin-bottom:24px;">Times Prontos para o Confronto</h2>
+
+    <div id="finalScoreBanner" class="final-score-banner hidden">
+      <div class="hint" style="text-transform:uppercase; letter-spacing:0.08em;">Pontuação Final (lançada pelo administrador)</div>
+      <div class="fs-points" id="finalScoreText"></div>
+      <div class="hint" id="finalScoreWinner" style="margin-top:6px;"></div>
+    </div>
+
+    <div class="summary-grid" id="summaryGrid"></div>
+
+    <div id="adminScorePanel" class="admin-score-panel hidden">
+      <h3 class="font-display" style="font-size:15px; color:var(--gold-bright);">Lançar Pontuação Final (admin)</h3>
+      <div class="grid-setup">
+        <div class="field"><label id="adminScoreLabel1">Pontos — Jogador 1</label><input type="number" id="adminScoreJ1"></div>
+        <div class="field"><label id="adminScoreLabel2">Pontos — Jogador 2</label><input type="number" id="adminScoreJ2"></div>
+        <div class="field">
+          <label>Vencedor</label>
+          <select id="adminScoreWinner">
+            <option value="">Empate / não definir</option>
+          </select>
+        </div>
+      </div>
+      <div class="msg" id="adminScoreMsg"></div>
+      <div class="center-actions"><button class="btn btn-primary" id="adminScoreBtn">Salvar Pontuação Final</button></div>
+    </div>
+
+    <div class="center-actions"><button class="btn btn-ghost" id="restartBtn">Novo Draft</button></div>
+  </section>
+</div>
+
+<!-- MODAL: escolher constelação (personagens) ou refinamento (armas) -->
+<div id="levelModal" class="modal-overlay hidden">
+  <div class="modal-box">
+    <h3 class="font-display" id="levelModalTitle" style="font-size:16px; color:var(--gold-bright); text-align:center;"></h3>
+    <p class="hint" style="text-align:center; margin-top:6px;" id="levelModalHint"></p>
+    <div class="level-grid" id="levelGrid"></div>
+    <div class="center-actions"><button class="btn btn-ghost" id="levelModalCancel">Cancelar</button></div>
+  </div>
+</div>
+
+<script src="js/config.js"></script>
+<script src="js/auth-client.js"></script>
+<script src="js/sheets.js"></script>
+</body>
+</html>
