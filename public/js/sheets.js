@@ -105,6 +105,7 @@ function levelLabelFor(phase, level){
 }
 
 function applyPick(estado, playerIdx, itemId, level){
+  if(level === undefined || level === null || isNaN(Number(level))) throw new Error('Nível/constelação inválido — tente escolher de novo.');
   const poolKey = estado.phase==='weapons' ? 'weapons' : 'characters';
   const byId = estado.phase==='weapons' ? WEAPON_BY_ID : CHAR_BY_ID;
   const idx = estado.pool[poolKey].indexOf(itemId);
@@ -140,7 +141,11 @@ function rarityClass(r){ return r>=5?'r5': r===4?'r4':'r3'; }
 function currentPool(){
   const ids = ST.phase==='weapons' ? ST.pool.weapons : ST.pool.characters;
   const byId = ST.phase==='weapons' ? WEAPON_BY_ID : CHAR_BY_ID;
-  return ids.map(id => byId[id]).filter(Boolean);
+  const resolved = ids.map(id => byId[id]).filter(Boolean);
+  if(ids.length > 0 && resolved.length === 0){
+    console.warn('[draft] pool tem', ids.length, 'ids mas nenhum bateu com o catálogo carregado (CHAR_BY_ID/WEAPON_BY_ID) — catálogo pode não ter carregado a tempo.');
+  }
+  return resolved;
 }
 
 function imgTag(it, size){
@@ -165,7 +170,8 @@ function renderSidePanels(){
         const it = allPicks[i];
         const chip = document.createElement('div');
         chip.className = 'pick-chip ' + rarityClass(it.rarity);
-        chip.innerHTML = `${imgTag(it,22)}<span>${it.name} <b style="color:var(--gold-bright);">${levelLabelFor(it.kind==='weapon'?'weapons':'characters', it.level)}</b></span><span class="cost">${it.cost}</span>`;
+        const levelLabel = it.level !== undefined && it.level !== null ? levelLabelFor(it.kind==='weapon'?'weapons':'characters', it.level) : '';
+        chip.innerHTML = `${imgTag(it,22)}<span>${it.name} <b style="color:var(--gold-bright);">${levelLabel}</b></span><span class="cost">${it.cost}</span>`;
         list.appendChild(chip);
       } else {
         const slot = document.createElement('div');
