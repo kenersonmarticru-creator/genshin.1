@@ -31,6 +31,18 @@
   .add-row input{ flex:1; background:var(--void-0); border:1px solid var(--line); color:var(--ink);
     border-radius:8px; padding:10px 12px; font-size:13px; font-family:inherit; }
   .add-row input:focus{ border-color:var(--gold); outline:none; }
+
+  .buffs-toolbar{ display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:2px 4px 12px; }
+  .buffs-toolbar .btn{ white-space:nowrap; }
+  #buffsTable .th-sub{ font-weight:400; text-transform:none; opacity:0.7; }
+  .buff-input{ width:64px; background:var(--void-0); border:1px solid var(--line); color:var(--ink);
+    border-radius:6px; padding:5px 6px; font-size:12.5px; text-align:center; }
+  .buff-input.wide{ width:150px; text-align:left; }
+  .buff-input:focus{ border-color:var(--gold); }
+  .buff-input.saved{ border-color:var(--ok); }
+  .buff-input.erro{ border-color:var(--danger); }
+  select.buff-input{ text-align:left; }
+  .buff-check{ width:18px; height:18px; cursor:pointer; }
 </style>
 </head>
 <body>
@@ -75,6 +87,7 @@
     <div class="tabs">
       <button class="tab-btn active" id="tabChars">Personagens</button>
       <button class="tab-btn" id="tabWeapons">Armas</button>
+      <button class="tab-btn" id="tabBuffs">Buffs de Kit</button>
     </div>
 
     <div class="field" id="adminSearch">
@@ -101,6 +114,34 @@
         </thead>
         <tbody id="weaponsBody"></tbody>
       </table>
+
+      <div class="hidden" id="buffsPanel">
+        <div class="buffs-toolbar">
+          <div>
+            <p class="hint" style="margin:0 0 4px;">A lista de personagens vem sozinha (Enka + Yatta). Preencha só os campos de buff que se aplicam a cada um — 0 ou em branco = sem efeito automático.</p>
+            <p class="hint" id="importStatusMsg" style="margin:0;"></p>
+          </div>
+          <button class="btn btn-primary" id="importBtn">Importar catálogo agora</button>
+        </div>
+        <table class="admin-table" id="buffsTable">
+          <thead>
+            <tr>
+              <th>Personagem</th>
+              <th>Stat Habilidade</th>
+              <th>Stat Explosão</th>
+              <th>Dano Time %<br><span class="th-sub">(Explosão/Passiva)</span></th>
+              <th>Condição do Dano Time</th>
+              <th>ATQ Time %</th>
+              <th>RES Shred %</th>
+              <th>Elementos do Shred</th>
+              <th>Bônus Reação %</th>
+              <th>Tipos de Reação</th>
+              <th>Ativo por padrão</th>
+            </tr>
+          </thead>
+          <tbody id="buffsBody"></tbody>
+        </table>
+      </div>
     </div>
   </section>
 </div>
