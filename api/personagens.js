@@ -12,6 +12,13 @@ module.exports = async function personagensHandler(req, res) {
       return res.status(200).json({ ok: true, characters, weapons });
     }
 
+    // GET /api/personagens?tipo=buffs -> buffs de kit por personagem (público,
+    // usado pela calculadora de dano em public/js/buffs.js)
+    if (req.method === 'GET' && req.query.tipo === 'buffs') {
+      const buffs = await sheets.getCharacterKitBuffs();
+      return res.status(200).json({ ok: true, buffs });
+    }
+
     // GET /api/personagens?userId=... -> personagens/constelações desse usuário
     if (req.method === 'GET' && req.query.userId) {
       const rows = await sheets.listUserCharacters(req.query.userId);
