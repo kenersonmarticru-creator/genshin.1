@@ -32,6 +32,21 @@ module.exports = async function adminHandler(req, res) {
       return res.status(200).json({ ok: true, limit });
     }
 
+    if (body.action === 'updateCharacterKitBuff') {
+      const { requesterId, name, field, value } = body;
+      await sheets.updateCharacterKitBuff({ requesterId, name, field, value });
+      return res.status(200).json({ ok: true });
+    }
+
+    // Import manual — o mesmo código que a Netlify Scheduled Function roda
+    // sozinha uma vez por semana (netlify/functions/weekly-import.js), mas
+    // disparável na hora pelo admin, sem precisar esperar o cron.
+    if (body.action === 'importCatalogFromYatta') {
+      const { requesterId } = body;
+      const resultado = await sheets.importCharacterBuffRows({ requesterId });
+      return res.status(200).json({ ok: true, ...resultado });
+    }
+
     return res.status(400).json({ ok: false, msg: 'Ação desconhecida: ' + body.action });
   } catch (err) {
     return res.status(400).json({ ok: false, msg: err.message });
