@@ -102,15 +102,67 @@ function detectTeamSetBuffs(team){
   return found;
 }
 
+// Converte UMA linha da planilha PersonagensBuffs (ver lib/sheets.js) nos
+// mesmos objetos de buff que CHARACTER_KIT_BUFFS usa — só gera uma entrada
+// pra cada campo que o admin de fato preencheu (valor > 0), pra não criar
+// buff fantasma de 0%.
+function serverRowToKitBuffDefs(row){
+  const defs = [];
+  if (row.buffDanoTimePercent > 0){
+    defs.push({
+      id: 'srv-teamdmg-' + row.name, character: row.name, scope: 'teamDmg', percent: row.buffDanoTimePercent,
+      label: `${row.name} — +${row.buffDanoTimePercent}% de dano de time${row.buffDanoTimeCondicao ? ' (' + row.buffDanoTimeCondicao + ')' : ''} [planilha]`,
+      defaultOn: row.ativoPadrao,
+    });
+  }
+  if (row.buffAtqTimePercent > 0){
+    defs.push({
+      id: 'srv-teamatk-' + row.name, character: row.name, scope: 'teamAtk', percent: row.buffAtqTimePercent,
+      label: `${row.name} — +${row.buffAtqTimePercent}% de ATQ de time [planilha]`,
+      defaultOn: row.ativoPadrao,
+    });
+  }
+  if (row.buffResShredPercent > 0){
+    defs.push({
+      id: 'srv-resshred-' + row.name, character: row.name, scope: 'enemyResShred', percent: row.buffResShredPercent,
+      label: `${row.name} — reduz ${row.buffResShredPercent}% de RES do inimigo${row.buffResShredElementos ? ' (' + row.buffResShredElementos + ')' : ''} [planilha]`,
+      defaultOn: row.ativoPadrao,
+    });
+  }
+  if (row.buffReacaoPercent > 0){
+    defs.push({
+      id: 'srv-reaction-' + row.name, character: row.name, scope: 'reactionBonus', percent: row.buffReacaoPercent,
+      reactions: (row.buffReacaoTipos || '').split(',').map(s => s.trim()).filter(Boolean),
+      label: `${row.name} — +${row.buffReacaoPercent}% em reações${row.buffReacaoTipos ? ' (' + row.buffReacaoTipos + ')' : ''} [planilha]`,
+      defaultOn: row.ativoPadrao,
+    });
+  }
+  return defs;
+}
+
 // Mesma ideia, mas olhando pra QUEM está no time (nome do personagem), não
 // pro que ele está vestindo — cobre os buffs de Habilidade/Explosão do kit.
+// Usa a planilha (SERVER_KIT_BUFFS, carregada em calc.js) quando disponível;
+// a lista fixa CHARACTER_KIT_BUFFS serve de seed/fallback pra quando o fetch
+// falhar ou pra personagem que a planilha ainda não cobre.
 function detectTeamKitBuffs(team){
   const found = [];
   team.forEach((slot, slotIdx) => {
     if (!slot || !slot.row) return;
-    CHARACTER_KIT_BUFFS.forEach(def => {
-      if (def.character === slot.row.character_name) found.push({ ...def, ownerSlot: slotIdx, source: 'kit' });
-    });
+    const name = slot.row.character_name;
+
+    const serverRow = (typeof SERVER_KIT_BUFFS !== 'undefined' && SERVER_KIT_BUFFS)
+      ? SERVER_KIT_BUFFS.find(b => b.name === name) : null;
+
+    if (serverRow){
+      serverRowToKitBuffDefs(serverRow).forEach(def => found.push({ ...def, ownerSlot: slotIdx, source: 'kit' }));
+    } else {
+      // Sem linha na planilha ainda (personagem novo, import semanal não
+      // rodou) — cai na lista fixa, se existir.
+      CHARACTER_KIT_BUFFS.forEach(def => {
+        if (def.character === name) found.push({ ...def, ownerSlot: slotIdx, source: 'kit' });
+      });
+    }
   });
   return found;
 }
