@@ -17,6 +17,21 @@ let MY_CHARS = [];
 let CHAR_CATALOG = [];
 let TEAM = new Array(TEAM_SIZE).fill(null);
 const TALENTS_CACHE = {}; // characterName -> talents[]
+// Catálogo de buffs de kit vindo da planilha (PersonagensBuffs), carregado
+// uma vez no boot. Fica null se o fetch falhar — nesse caso buffs.js usa só
+// o array fixo CHARACTER_KIT_BUFFS/OFF_ATK_SCALING como rede de segurança,
+// em vez de travar a calculadora inteira por causa disso.
+let SERVER_KIT_BUFFS = null;
+
+async function loadServerKitBuffs(){
+  try{
+    const res = await fetch('/api/personagens?tipo=buffs');
+    const json = await res.json();
+    return (json && json.ok) ? json.buffs : null;
+  } catch {
+    return null;
+  }
+}
 const DPS_SLOT = 0; // Slot 1 (primeiro slot) é sempre o DPS — recebe os buffs do time inteiro
 let DPS_ACTIVE_BUFFS = new Set(); // chaves "id:ownerSlot" dos buffs de set marcados como ativos
 let DPS_SEEN_BUFFS = new Set(); // chaves já vistas, pra não reaplicar o padrão toda hora e respeitar o toggle manual do usuário
@@ -114,11 +129,42 @@ const OFF_ATK_SCALING = {
   // Xilonen escala com DEF (Habilidade e Explosão).
   'Xilonen': { 1: 'def', 2: 'def' },
 };
-function autoStatFor(characterName, talent){
-  if (!talent) return 'atk';
+function serverKitBuffFor(characterName){
+  if (!SERVER_KIT_BUFFS) return null;
+  return SERVER_KIT_BUFFS.find(b => b.name === characterName) || null;
+}
+
+// Ordem de prioridade pra decidir se um golpe escala com ATQ/HP/DEF:
+//  1) Planilha (PersonagensBuffs, coluna StatHabilidade/StatExplosao) — o
+//     admin já conferiu isso à mão, é a fonte mais confiável.
+//  2) Lista fixa OFF_ATK_SCALING neste arquivo — serve de seed/fallback
+//     pros personagens mais comuns, e continua funcionando se a planilha
+//     estiver fora do ar.
+//  3) Chute automático da Yatta (talent.scalingGuess) — só entra se as duas
+//     de cima não disserem nada.
+//  4) Padrão: ATQ.
+function autoStatDetail(characterName, talent){
+  if (!talent) return { stat: 'atk', guessed: false };
+
+  const serverBuff = serverKitBuffFor(characterName);
+  const serverField = talent.type === 1 ? 'statHabilidade' : talent.type === 2 ? 'statExplosao' : null;
+  if (serverBuff && serverField && (serverBuff[serverField] === 'hp' || serverBuff[serverField] === 'def')) {
+    return { stat: serverBuff[serverField], guessed: false };
+  }
+
   const override = OFF_ATK_SCALING[characterName];
-  if (override && override[talent.type]) return override[talent.type];
-  return 'atk';
+  if (override && override[talent.type]) return { stat: override[talent.type], guessed: false };
+
+  // Personagem sem cadastro manual — tenta o chute vindo da descrição da
+  // Yatta (ver lib/talents.js). Só usamos quando aponta pra HP/DEF; se não
+  // achou nada específico no texto, cai no padrão ATQ, igual antes.
+  if (talent.scalingGuess === 'hp' || talent.scalingGuess === 'def'){
+    return { stat: talent.scalingGuess, guessed: true };
+  }
+  return { stat: 'atk', guessed: false };
+}
+function autoStatFor(characterName, talent){
+  return autoStatDetail(characterName, talent).stat;
 }
 
 // Ataque Normal/Carregado/Investida (type 0) geralmente é dano Físico, a menos
@@ -315,6 +361,7 @@ function defaultHit(talents, characterName){
 function renderHitHtml(slotIdx, hitIdx, hit, talents, row, globals, autoBuffs){
   const r = calcHitDamage(hit, row, globals, autoBuffs);
   const setBonusPercent = (autoBuffs && hit.talent) ? (autoBuffs.extraDmgByTalentType[hit.talent.type] || 0) : 0;
+  const scalingDetail = autoStatDetail(row.character_name, hit.talent);
   return `
     <div class="talent-row" style="border-top:1px solid var(--line); padding-top:10px; margin-top:10px;" data-hit="${hitIdx}">
       <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -334,6 +381,7 @@ function renderHitHtml(slotIdx, hitIdx, hit, talents, row, globals, autoBuffs){
           <option value="def" ${hit.statChoice==='def'?'selected':''}>DEF (auto)</option>
         </select>
       </div>
+      ${scalingDetail.guessed ? `<p class="hint" style="margin-top:4px; font-size:10px; color:var(--gold-bright);">🔍 Personagem sem cadastro manual — escala de <b>${scalingDetail.stat.toUpperCase()}</b> foi um chute lido no texto oficial da habilidade (via Yatta). Confira se bate com o kit real antes de confiar no número.</p>` : ''}
       <div class="mini-row" style="margin-top:6px;">
         <select class="dmgtype-select" data-slot="${slotIdx}" data-hit="${hitIdx}" title="Detectado automaticamente pelo tipo de talento (Normal = Físico, Habilidade/Explosão = elemento do personagem) — troque em caso de infusão elemental">
           <option value="physical" ${(hit.damageType||autoDamageTypeFor(hit.talent))==='physical'?'selected':''}>Dano Físico (auto)</option>
@@ -511,9 +559,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   try{
-    [MY_CHARS, CHAR_CATALOG] = await Promise.all([
+    [MY_CHARS, CHAR_CATALOG, SERVER_KIT_BUFFS] = await Promise.all([
       fetchMyCharacters(session.id),
       loadCharacters(),
+      loadServerKitBuffs(),
     ]);
   } catch(e){
     grid.innerHTML = `<p class="hint" style="color:var(--danger);">Erro ao carregar seus personagens: ${e.message}</p>`;
